@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Analyzer</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        #v-container { flex: 1; position: relative; background: #111; display: flex; align-items: center; justify-content: center; }
+        video { display: none; }
+        canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-bottom: env(safe-area-inset-bottom); }
+        input, button { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 8px; font-size: 16px; width: 100%; box-sizing: border-box; }
+        .full { grid-column: span 2; }
+        #msg { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 4px; z-index: 10; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div id="v-container">
+        <div id="msg">モデル読み込み中...</div>
+        <video id="vid" playsinline muted loop></video>
+        <canvas id="can"></canvas>
+    </div>
+    <div id="ui">
+        <input type="file" id="f" accept="video/*" class="full">
+        <label>追跡色: <input type="color" id="cp" value="#ff0000"></label>
+        <label>ズーム: <input type="range" id="zs" min="0.1" max="1.0" step="0.1" value="0.4"></label>
+        <button id="btn" class="full">解析・追跡スタート</button>
+    </div>
+    <script>
+        const video = document.getElementById('vid');
+        const canvas = document.getElementById('can');
+        const ctx = canvas.getContext('2d');
+        const msg = document.getElementById('msg');
+        let model;
+
+        (async () => {
+            try {
+                model = await cocoSsd.load();
+                msg.innerText = "✅ 準備完了。動画を選択してください。";
+            } catch (e) { msg.innerText = "❌ ロード失敗"; }
+        })();
+
+        document.getElementById('f').onchange = (e) => {
+            video.src = URL.createObjectURL(e.target.files[0]);
+            msg.innerText = "動画読み込み完了。";
+        };
+
+        document.getElementById('btn').onclick = () => {
+            video.play();
+            render();
+        };
+
+        function render() {
+            if (video.paused || video.ended) return;
+            model.detect(video).then(predictions => {
+                const w = video.videoWidth;
+                const h = video.videoHeight;
+                canvas.width = w;
+                canvas.height = h;
+                
+                let target = predictions.find(p => p.class === 'person');
+                
+                if (target) {
+                    const [bx, by, bw, bh] = target.bbox;
+                    const zoom = parseFloat(document.getElementById('zs').value);
+                    const zw = w * zoom;
+                    const zh = h * zoom;
+                    const cx = bx + bw / 2;
+                    const cy = by + bh / 2;
+                    
+                    const sx = Math.max(0, Math.min(cx - zw / 2, w - zw));
+                    const sy = Math.max(0, Math.min(cy - zh / 2, h - zh));
+                    
+                    ctx.drawImage(video, sx, sy, zw, zh, 0, 0, w, h);
+                } else {
+                    ctx.drawImage(video, 0, 0, w, h);
+                }
+                requestAnimationFrame(render);
+            });
+        }
+    </script>
+</body>
+</html>
