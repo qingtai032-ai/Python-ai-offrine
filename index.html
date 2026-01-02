@@ -5,7 +5,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Body-Only Pose Analyzer</title>
+    <title>Ultimate Pose Analyzer</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
     <style>
@@ -14,28 +14,28 @@
         canvas { max-width: 100%; max-height: 100%; object-fit: contain; background: #000; }
         video { display: none; }
         #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid #444; }
-        button, input { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 10px; font-size: 14px; -webkit-appearance: none; }
-        #msg { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 8px; z-index: 100; font-size: 12px; border: 1px solid #555; }
+        button, input { background: #444; color: #fff; border: 1px solid #666; padding: 14px; border-radius: 12px; font-size: 14px; -webkit-appearance: none; }
+        #msg { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.85); padding: 10px 15px; border-radius: 10px; z-index: 100; font-size: 12px; border: 1px solid #0ff; color: #0ff; }
         .full { grid-column: span 2; }
-        #recBtn.active { background: #a22; border-color: #f55; }
+        #recBtn.active { background: #d22; box-shadow: 0 0 15px #f00; }
     </style>
 </head>
 <body>
 
     <div id="v-container">
-        <div id="msg">AIモデル準備中...</div>
+        <div id="msg">AI高精度エンジン起動中...</div>
         <video id="vid" playsinline muted></video>
         <canvas id="can"></canvas>
     </div>
 
     <div id="ui">
         <input type="file" id="f" accept="video/*" class="full">
-        <button id="startBtn">▶ 解析開始</button>
-        <button id="recBtn">💾 録画して保存</button>
-        <div style="grid-column: span 2; display: flex; gap: 15px; align-items: center; background: #333; padding: 10px; border-radius: 8px;">
-            <label style="font-size: 12px;">ズーム</label>
+        <button id="startBtn" style="background: #252;">▶ 解析開始</button>
+        <button id="recBtn">💾 動画を保存</button>
+        <div style="grid-column: span 2; display: flex; gap: 15px; align-items: center; background: #333; padding: 12px; border-radius: 10px;">
+            <label style="font-size: 12px; color: #aaa;">ZOOM</label>
             <input type="range" id="zs" min="0.1" max="1.0" step="0.05" value="0.4" style="flex: 1;">
-            <span id="zoomVal">0.4</span>
+            <span id="zoomVal" style="font-weight: bold; width: 35px;">0.4</span>
         </div>
     </div>
 
@@ -46,10 +46,12 @@
         const msg = document.getElementById('msg');
         let detector, recorder, chunks = [];
 
+        // 補正・スムージング用メモリ
         let lastSX = 0, lastSY = 0, velX = 0, velY = 0;
-        const lerpAmount = 0.12; 
+        let smoothKeypoints = []; // 座標補間用
+        const lerpAmount = 0.15; 
+        const kpSmoothing = 0.5; // 関節の動きを滑らかにする（0.1~0.9, 大きいほど滑らか）
 
-        // 骨格接続 (顔パーツ 0-4 を除いた 5以降を使用)
         const connections = [
             [5, 7], [7, 9], [6, 8], [8, 10], // 腕
             [5, 6], [5, 11], [6, 12], [11, 12], // 胴体
@@ -60,14 +62,19 @@
             try {
                 const model = poseDetection.SupportedModels.MoveNet;
                 detector = await poseDetection.createDetector(model, {
-                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER
+                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER,
+                    enableSmoothing: true // モデル側のスムージングも有効化
                 });
-                msg.innerText = "✅ 準備完了 (体幹トラッキング・顔除外)";
-            } catch (e) { msg.innerText = "❌ AI初期化エラー"; }
+                msg.innerText = "READY: 高精度トラッキング有効";
+            } catch (e) { msg.innerText = "ERROR: AI初期化失敗"; }
         }
 
         document.getElementById('f').onchange = (e) => {
             video.src = URL.createObjectURL(e.target.files[0]);
+        };
+
+        document.getElementById('zs').oninput = (e) => {
+            document.getElementById('zoomVal').innerText = e.target.value;
         };
 
         async function render() {
@@ -84,50 +91,73 @@
 
             if (poses && poses.length > 0) {
                 const kp = poses[0].keypoints;
-                // インデックス 5番(肩)以降のみをトラッキング対象にする
-                const bodyKps = kp.slice(5).filter(k => k.score > 0.35);
+                
+                // 初回のみsmoothKeypointsを初期化
+                if (smoothKeypoints.length === 0) smoothKeypoints = JSON.parse(JSON.stringify(kp));
+
+                // 関節座標の補正（前フレームとの合成）
+                kp.forEach((p, i) => {
+                    if (p.score > 0.2) {
+                        smoothKeypoints[i].x = smoothKeypoints[i].x * kpSmoothing + p.x * (1 - kpSmoothing);
+                        smoothKeypoints[i].y = smoothKeypoints[i].y * kpSmoothing + p.y * (1 - kpSmoothing);
+                        smoothKeypoints[i].score = p.score;
+                    }
+                });
+
+                const bodyKps = smoothKeypoints.slice(5).filter(k => k.score > 0.3);
 
                 if (bodyKps.length > 0) {
                     const avgX = bodyKps.reduce((s, k) => s + k.x, 0) / bodyKps.length;
                     const avgY = bodyKps.reduce((s, k) => s + k.y, 0) / bodyKps.length;
-                    
                     targetSX = Math.max(0, Math.min(avgX - sw / 2, w - sw));
                     targetSY = Math.max(0, Math.min(avgY - sh / 2, h - sh));
                     velX = targetSX - lastSX; velY = targetSY - lastSY;
                 } else {
                     targetSX = Math.max(0, Math.min(lastSX + velX, w - sw));
                     targetSY = Math.max(0, Math.min(lastSY + velY, h - sh));
-                    velX *= 0.95; velY *= 0.95;
+                    velX *= 0.98; velY *= 0.98;
                 }
             }
 
             lastSX += (targetSX - lastSX) * lerpAmount;
             lastSY += (targetSY - lastSY) * lerpAmount;
 
+            // 背景（ズーム）描画
             ctx.drawImage(video, lastSX, lastSY, sw, sh, 0, 0, w, h);
 
-            if (poses && poses.length > 0) {
-                const kp = poses[0].keypoints;
+            if (smoothKeypoints.length > 0) {
                 const sX = w / sw; const sY = h / sh;
 
-                ctx.strokeStyle = "#00FFFF"; ctx.lineWidth = 10; ctx.lineCap = "round";
+                // 1. 骨格（太いシアン線）
+                ctx.strokeStyle = "#00FFFF"; 
+                ctx.lineWidth = 14; // さらに太く
+                ctx.lineCap = "round"; 
+                ctx.lineJoin = "round"; // 接合部を滑らかに
+                ctx.shadowBlur = 10; ctx.shadowColor = "#00FFFF"; // 発光エフェクト
+
                 connections.forEach(([i, j]) => {
-                    if (kp[i].score > 0.35 && kp[j].score > 0.35) {
+                    const p1 = smoothKeypoints[i];
+                    const p2 = smoothKeypoints[j];
+                    if (p1.score > 0.3 && p2.score > 0.3) {
                         ctx.beginPath();
-                        ctx.moveTo((kp[i].x - lastSX) * sX, (kp[i].y - lastSY) * sY);
-                        ctx.lineTo((kp[j].x - lastSX) * sX, (kp[j].y - lastSY) * sY);
+                        ctx.moveTo((p1.x - lastSX) * sX, (p1.y - lastSY) * sY);
+                        ctx.lineTo((p2.x - lastSX) * sX, (p2.y - lastSY) * sY);
                         ctx.stroke();
                     }
                 });
+                ctx.shadowBlur = 0; // 関節には発光をかけない
 
-                ctx.fillStyle = "#FF8800";
-                kp.forEach((p, idx) => {
-                    // インデックス 5番(左肩)以降のみ描画
-                    if (p.score > 0.35 && idx >= 5) {
+                // 2. 関節（オレンジの大きな丸）
+                ctx.fillStyle = "#FF7700";
+                smoothKeypoints.forEach((p, idx) => {
+                    if (p.score > 0.3 && idx >= 5) {
                         const rx = (p.x - lastSX) * sX;
                         const ry = (p.y - lastSY) * sY;
-                        ctx.beginPath(); ctx.arc(rx, ry, 12, 0, Math.PI * 2); ctx.fill();
-                        ctx.strokeStyle = "#FFF"; ctx.lineWidth = 3; ctx.stroke();
+                        ctx.beginPath(); 
+                        ctx.arc(rx, ry, 15, 0, Math.PI * 2); // 半径15
+                        ctx.fill();
+                        ctx.strokeStyle = "#FFFFFF"; ctx.lineWidth = 4;
+                        ctx.stroke();
                     }
                 });
             }
@@ -140,22 +170,22 @@
             if (recorder?.state === 'recording') {
                 recorder.stop();
                 e.target.classList.remove('active');
-                e.target.innerText = "💾 録画して保存";
+                e.target.innerText = "💾 動画を保存";
             } else {
                 chunks = [];
                 const stream = canvas.captureStream(30);
                 const mimeType = ["video/mp4;codecs=avc1", "video/webm"].find(t => MediaRecorder.isTypeSupported(t));
-                recorder = new MediaRecorder(stream, { mimeType });
+                recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 5000000 }); // 高画質設定
                 recorder.ondataavailable = ev => chunks.push(ev.data);
                 recorder.onstop = () => {
                     const blob = new Blob(chunks, { type: recorder.mimeType });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a'); a.href = url;
-                    a.download = `body_pose_${Date.now()}.mp4`;
+                    a.download = `pose_high_res_${Date.now()}.mp4`;
                     a.click();
                 };
                 recorder.start();
-                e.target.classList.add('active'); e.target.innerText = "🔴 停止";
+                e.target.classList.add('active'); e.target.innerText = "🔴 録画停止";
             }
         };
 
