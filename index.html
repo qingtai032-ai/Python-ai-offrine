@@ -3,86 +3,147 @@
 <head>
     <meta charset="UTF-8">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI Analyzer</title>
+    <title>Smooth Pose Analyzer</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
     <style>
-        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         #v-container { flex: 1; position: relative; background: #111; display: flex; align-items: center; justify-content: center; }
-        video { display: none; }
         canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
-        #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-bottom: env(safe-area-inset-bottom); }
-        input, button { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 8px; font-size: 16px; width: 100%; box-sizing: border-box; }
-        .full { grid-column: span 2; }
+        video { display: none; }
+        #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding-bottom: env(safe-area-inset-bottom); }
+        button, input { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 8px; font-size: 14px; }
         #msg { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 4px; z-index: 10; font-size: 12px; }
     </style>
 </head>
 <body>
     <div id="v-container">
-        <div id="msg">モデル読み込み中...</div>
-        <video id="vid" playsinline muted loop></video>
+        <div id="msg">AI準備中...</div>
+        <video id="vid" playsinline muted></video>
         <canvas id="can"></canvas>
     </div>
     <div id="ui">
-        <input type="file" id="f" accept="video/*" class="full">
-        <label>追跡色: <input type="color" id="cp" value="#ff0000"></label>
-        <label>ズーム: <input type="range" id="zs" min="0.1" max="1.0" step="0.1" value="0.4"></label>
-        <button id="btn" class="full">解析・追跡スタート</button>
+        <input type="file" id="f" accept="video/*" style="grid-column: span 2;">
+        <button id="startBtn">解析開始</button>
+        <button id="recBtn">録画保存</button>
+        <div style="grid-column: span 2; display: flex; gap: 10px; align-items: center;">
+            <label>ズーム倍率: <input type="range" id="zs" min="0.1" max="1.0" step="0.05" value="0.4"></label>
+            <span id="zoomVal">0.4</span>
+        </div>
     </div>
+
     <script>
         const video = document.getElementById('vid');
         const canvas = document.getElementById('can');
         const ctx = canvas.getContext('2d');
         const msg = document.getElementById('msg');
-        let model;
+        let detector, recorder, chunks = [];
 
-        (async () => {
-            try {
-                model = await cocoSsd.load();
-                msg.innerText = "✅ 準備完了。動画を選択してください。";
-            } catch (e) { msg.innerText = "❌ ロード失敗"; }
-        })();
+        // スムージング用変数
+        let lastSX = 0, lastSY = 0;
+        let velX = 0, velY = 0; // 速度（慣性用）
+        const lerpAmount = 0.15; // 滑らかさ（小さいほどゆっくり追従）
+
+        // 骨格の繋がり定義
+        const connections = [
+            [5, 7], [7, 9], [6, 8], [8, 10], // 腕
+            [5, 6], [5, 11], [6, 12], [11, 12], // 胴体
+            [11, 13], [13, 15], [12, 14], [14, 16] // 足
+        ];
+
+        async function init() {
+            const model = poseDetection.SupportedModels.MoveNet;
+            detector = await poseDetection.createDetector(model);
+            msg.innerText = "✅ 準備完了";
+        }
 
         document.getElementById('f').onchange = (e) => {
             video.src = URL.createObjectURL(e.target.files[0]);
-            msg.innerText = "動画読み込み完了。";
         };
 
-        document.getElementById('btn').onclick = () => {
-            video.play();
-            render();
-        };
-
-        function render() {
+        async function render() {
             if (video.paused || video.ended) return;
-            model.detect(video).then(predictions => {
-                const w = video.videoWidth;
-                const h = video.videoHeight;
-                canvas.width = w;
-                canvas.height = h;
+            const poses = await detector.estimatePoses(video);
+            
+            const w = video.videoWidth;
+            const h = video.videoHeight;
+            canvas.width = w; canvas.height = h;
+
+            let targetSX = lastSX, targetSY = lastSY;
+            const zoom = parseFloat(document.getElementById('zs').value);
+            const sw = w * zoom, sh = h * zoom;
+
+            if (poses.length > 0 && poses[0].keypoints.find(kp => kp.score > 0.3)) {
+                // 人を検知できた場合
+                const pose = poses[0];
+                const keypoints = pose.keypoints;
                 
-                let target = predictions.find(p => p.class === 'person');
-                
-                if (target) {
-                    const [bx, by, bw, bh] = target.bbox;
-                    const zoom = parseFloat(document.getElementById('zs').value);
-                    const zw = w * zoom;
-                    const zh = h * zoom;
-                    const cx = bx + bw / 2;
-                    const cy = by + bh / 2;
-                    
-                    const sx = Math.max(0, Math.min(cx - zw / 2, w - zw));
-                    const sy = Math.max(0, Math.min(cy - zh / 2, h - zh));
-                    
-                    ctx.drawImage(video, sx, sy, zw, zh, 0, 0, w, h);
-                } else {
-                    ctx.drawImage(video, 0, 0, w, h);
-                }
-                requestAnimationFrame(render);
-            });
+                // 全関節の平均座標をセンターにする（安定化）
+                const validKps = keypoints.filter(k => k.score > 0.3);
+                const avgX = validKps.reduce((s, k) => s + k.x, 0) / validKps.length;
+                const avgY = validKps.reduce((s, k) => s + k.y, 0) / validKps.length;
+
+                targetSX = Math.max(0, Math.min(avgX - sw / 2, w - sw));
+                targetSY = Math.max(0, Math.min(avgY - sh / 2, h - sh));
+
+                // 速度（慣性）を計算
+                velX = targetSX - lastSX;
+                velY = targetSY - lastSY;
+            } else {
+                // ロストした場合：前回の速度を維持して「慣性」で動く
+                targetSX = Math.max(0, Math.min(lastSX + velX, w - sw));
+                targetSY = Math.max(0, Math.min(lastSY + velY, h - sh));
+                // 徐々に減速
+                velX *= 0.9; velY *= 0.9;
+            }
+
+            // 線形補間(LERP)でガクつきを抑える
+            lastSX += (targetSX - lastSX) * lerpAmount;
+            lastSY += (targetSY - lastSY) * lerpAmount;
+
+            // 描画
+            ctx.drawImage(video, lastSX, lastSY, sw, sh, 0, 0, w, h);
+
+            // ボーンの描画
+            if (poses.length > 0) {
+                const kp = poses[0].keypoints;
+                ctx.strokeStyle = "#00FF00"; ctx.lineWidth = 4;
+                ctx.fillStyle = "#00FF00";
+
+                connections.forEach(([i, j]) => {
+                    if (kp[i].score > 0.3 && kp[j].score > 0.3) {
+                        ctx.beginPath();
+                        ctx.moveTo((kp[i].x - lastSX) * (w/sw), (kp[i].y - lastSY) * (h/sh));
+                        ctx.lineTo((kp[j].x - lastSX) * (w/sw), (kp[j].y - lastSY) * (h/sh));
+                        ctx.stroke();
+                    }
+                });
+            }
+            requestAnimationFrame(render);
         }
+
+        document.getElementById('startBtn').onclick = () => { video.play(); render(); };
+        init();
+
+        // 録画機能（前回と同じ）
+        document.getElementById('recBtn').onclick = (e) => {
+            if (recorder?.state === 'recording') {
+                recorder.stop(); e.target.innerText = "録画保存";
+            } else {
+                chunks = [];
+                const stream = canvas.captureStream(30);
+                recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+                recorder.ondataavailable = ev => chunks.push(ev.data);
+                recorder.onstop = () => {
+                    const blob = new Blob(chunks, { type: 'video/mp4' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a'); a.href = url; a.download = 'output.mp4'; a.click();
+                };
+                recorder.start(); e.target.innerText = "🔴 停止";
+            }
+        };
     </script>
 </body>
 </html>
+
