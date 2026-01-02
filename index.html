@@ -3,32 +3,38 @@
 <head>
     <meta charset="UTF-8">
     <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smooth Pose Analyzer</title>
+    <title>Body-Only Pose Analyzer</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
     <style>
         body { margin: 0; background: #000; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         #v-container { flex: 1; position: relative; background: #111; display: flex; align-items: center; justify-content: center; }
-        canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+        canvas { max-width: 100%; max-height: 100%; object-fit: contain; background: #000; }
         video { display: none; }
-        #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding-bottom: env(safe-area-inset-bottom); }
-        button, input { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 8px; font-size: 14px; }
-        #msg { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 8px; border-radius: 4px; z-index: 10; font-size: 12px; }
+        #ui { background: #222; padding: 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid #444; }
+        button, input { background: #444; color: #fff; border: 1px solid #666; padding: 12px; border-radius: 10px; font-size: 14px; -webkit-appearance: none; }
+        #msg { position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.8); padding: 10px; border-radius: 8px; z-index: 100; font-size: 12px; border: 1px solid #555; }
+        .full { grid-column: span 2; }
+        #recBtn.active { background: #a22; border-color: #f55; }
     </style>
 </head>
 <body>
+
     <div id="v-container">
-        <div id="msg">AI準備中...</div>
+        <div id="msg">AIモデル準備中...</div>
         <video id="vid" playsinline muted></video>
         <canvas id="can"></canvas>
     </div>
+
     <div id="ui">
-        <input type="file" id="f" accept="video/*" style="grid-column: span 2;">
-        <button id="startBtn">解析開始</button>
-        <button id="recBtn">録画保存</button>
-        <div style="grid-column: span 2; display: flex; gap: 10px; align-items: center;">
-            <label>ズーム倍率: <input type="range" id="zs" min="0.1" max="1.0" step="0.05" value="0.4"></label>
+        <input type="file" id="f" accept="video/*" class="full">
+        <button id="startBtn">▶ 解析開始</button>
+        <button id="recBtn">💾 録画して保存</button>
+        <div style="grid-column: span 2; display: flex; gap: 15px; align-items: center; background: #333; padding: 10px; border-radius: 8px;">
+            <label style="font-size: 12px;">ズーム</label>
+            <input type="range" id="zs" min="0.1" max="1.0" step="0.05" value="0.4" style="flex: 1;">
             <span id="zoomVal">0.4</span>
         </div>
     </div>
@@ -40,12 +46,10 @@
         const msg = document.getElementById('msg');
         let detector, recorder, chunks = [];
 
-        // スムージング用変数
-        let lastSX = 0, lastSY = 0;
-        let velX = 0, velY = 0; // 速度（慣性用）
-        const lerpAmount = 0.15; // 滑らかさ（小さいほどゆっくり追従）
+        let lastSX = 0, lastSY = 0, velX = 0, velY = 0;
+        const lerpAmount = 0.12; 
 
-        // 骨格の繋がり定義
+        // 骨格接続 (顔パーツ 0-4 を除いた 5以降を使用)
         const connections = [
             [5, 7], [7, 9], [6, 8], [8, 10], // 腕
             [5, 6], [5, 11], [6, 12], [11, 12], // 胴体
@@ -53,9 +57,13 @@
         ];
 
         async function init() {
-            const model = poseDetection.SupportedModels.MoveNet;
-            detector = await poseDetection.createDetector(model);
-            msg.innerText = "✅ 準備完了";
+            try {
+                const model = poseDetection.SupportedModels.MoveNet;
+                detector = await poseDetection.createDetector(model, {
+                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER
+                });
+                msg.innerText = "✅ 準備完了 (体幹トラッキング・顔除外)";
+            } catch (e) { msg.innerText = "❌ AI初期化エラー"; }
         }
 
         document.getElementById('f').onchange = (e) => {
@@ -64,59 +72,62 @@
 
         async function render() {
             if (video.paused || video.ended) return;
+
             const poses = await detector.estimatePoses(video);
-            
             const w = video.videoWidth;
             const h = video.videoHeight;
             canvas.width = w; canvas.height = h;
 
-            let targetSX = lastSX, targetSY = lastSY;
             const zoom = parseFloat(document.getElementById('zs').value);
-            const sw = w * zoom, sh = h * zoom;
+            const sw = w * zoom; const sh = h * zoom;
+            let targetSX = lastSX; let targetSY = lastSY;
 
-            if (poses.length > 0 && poses[0].keypoints.find(kp => kp.score > 0.3)) {
-                // 人を検知できた場合
-                const pose = poses[0];
-                const keypoints = pose.keypoints;
-                
-                // 全関節の平均座標をセンターにする（安定化）
-                const validKps = keypoints.filter(k => k.score > 0.3);
-                const avgX = validKps.reduce((s, k) => s + k.x, 0) / validKps.length;
-                const avgY = validKps.reduce((s, k) => s + k.y, 0) / validKps.length;
+            if (poses && poses.length > 0) {
+                const kp = poses[0].keypoints;
+                // インデックス 5番(肩)以降のみをトラッキング対象にする
+                const bodyKps = kp.slice(5).filter(k => k.score > 0.35);
 
-                targetSX = Math.max(0, Math.min(avgX - sw / 2, w - sw));
-                targetSY = Math.max(0, Math.min(avgY - sh / 2, h - sh));
-
-                // 速度（慣性）を計算
-                velX = targetSX - lastSX;
-                velY = targetSY - lastSY;
-            } else {
-                // ロストした場合：前回の速度を維持して「慣性」で動く
-                targetSX = Math.max(0, Math.min(lastSX + velX, w - sw));
-                targetSY = Math.max(0, Math.min(lastSY + velY, h - sh));
-                // 徐々に減速
-                velX *= 0.9; velY *= 0.9;
+                if (bodyKps.length > 0) {
+                    const avgX = bodyKps.reduce((s, k) => s + k.x, 0) / bodyKps.length;
+                    const avgY = bodyKps.reduce((s, k) => s + k.y, 0) / bodyKps.length;
+                    
+                    targetSX = Math.max(0, Math.min(avgX - sw / 2, w - sw));
+                    targetSY = Math.max(0, Math.min(avgY - sh / 2, h - sh));
+                    velX = targetSX - lastSX; velY = targetSY - lastSY;
+                } else {
+                    targetSX = Math.max(0, Math.min(lastSX + velX, w - sw));
+                    targetSY = Math.max(0, Math.min(lastSY + velY, h - sh));
+                    velX *= 0.95; velY *= 0.95;
+                }
             }
 
-            // 線形補間(LERP)でガクつきを抑える
             lastSX += (targetSX - lastSX) * lerpAmount;
             lastSY += (targetSY - lastSY) * lerpAmount;
 
-            // 描画
             ctx.drawImage(video, lastSX, lastSY, sw, sh, 0, 0, w, h);
 
-            // ボーンの描画
-            if (poses.length > 0) {
+            if (poses && poses.length > 0) {
                 const kp = poses[0].keypoints;
-                ctx.strokeStyle = "#00FF00"; ctx.lineWidth = 4;
-                ctx.fillStyle = "#00FF00";
+                const sX = w / sw; const sY = h / sh;
 
+                ctx.strokeStyle = "#00FFFF"; ctx.lineWidth = 10; ctx.lineCap = "round";
                 connections.forEach(([i, j]) => {
-                    if (kp[i].score > 0.3 && kp[j].score > 0.3) {
+                    if (kp[i].score > 0.35 && kp[j].score > 0.35) {
                         ctx.beginPath();
-                        ctx.moveTo((kp[i].x - lastSX) * (w/sw), (kp[i].y - lastSY) * (h/sh));
-                        ctx.lineTo((kp[j].x - lastSX) * (w/sw), (kp[j].y - lastSY) * (h/sh));
+                        ctx.moveTo((kp[i].x - lastSX) * sX, (kp[i].y - lastSY) * sY);
+                        ctx.lineTo((kp[j].x - lastSX) * sX, (kp[j].y - lastSY) * sY);
                         ctx.stroke();
+                    }
+                });
+
+                ctx.fillStyle = "#FF8800";
+                kp.forEach((p, idx) => {
+                    // インデックス 5番(左肩)以降のみ描画
+                    if (p.score > 0.35 && idx >= 5) {
+                        const rx = (p.x - lastSX) * sX;
+                        const ry = (p.y - lastSY) * sY;
+                        ctx.beginPath(); ctx.arc(rx, ry, 12, 0, Math.PI * 2); ctx.fill();
+                        ctx.strokeStyle = "#FFF"; ctx.lineWidth = 3; ctx.stroke();
                     }
                 });
             }
@@ -124,26 +135,31 @@
         }
 
         document.getElementById('startBtn').onclick = () => { video.play(); render(); };
-        init();
 
-        // 録画機能（前回と同じ）
         document.getElementById('recBtn').onclick = (e) => {
             if (recorder?.state === 'recording') {
-                recorder.stop(); e.target.innerText = "録画保存";
+                recorder.stop();
+                e.target.classList.remove('active');
+                e.target.innerText = "💾 録画して保存";
             } else {
                 chunks = [];
                 const stream = canvas.captureStream(30);
-                recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+                const mimeType = ["video/mp4;codecs=avc1", "video/webm"].find(t => MediaRecorder.isTypeSupported(t));
+                recorder = new MediaRecorder(stream, { mimeType });
                 recorder.ondataavailable = ev => chunks.push(ev.data);
                 recorder.onstop = () => {
-                    const blob = new Blob(chunks, { type: 'video/mp4' });
+                    const blob = new Blob(chunks, { type: recorder.mimeType });
                     const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a'); a.href = url; a.download = 'output.mp4'; a.click();
+                    const a = document.createElement('a'); a.href = url;
+                    a.download = `body_pose_${Date.now()}.mp4`;
+                    a.click();
                 };
-                recorder.start(); e.target.innerText = "🔴 停止";
+                recorder.start();
+                e.target.classList.add('active'); e.target.innerText = "🔴 停止";
             }
         };
+
+        init();
     </script>
 </body>
 </html>
-
